@@ -1,12 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  phases/phase_dex_convert.cpp  —  Phase 08: DEX_CONVERT
-//  Convert .class files → classes.dex using d8
-//
-//  CRITICAL: kotlin-stdlib.jar must be passed as a d8 INPUT (not --lib).
-//  When kotlinc compiles .kt files the output .class files contain bytecode
-//  that calls kotlin.jvm.internal.Intrinsics and other stdlib classes.
-//  If those classes are not in classes.dex the app crashes at launch with:
-//    NoClassDefFoundError: Failed resolution of: Lkotlin/jvm/internal/Intrinsics
 // ─────────────────────────────────────────────────────────────────────────────
 #include "phase_dex_convert.hpp"
 #include "../error/error_reporter.hpp"
@@ -16,103 +9,71 @@
 
 namespace kinetic {
 
-fs::path phase_dex_convert(const KineticConfig& cfg,
-                            const KineticEnv& env,
-                            const fs::path& project_root,
-                            const fs::path& classes_dir,
-                            const fs::path& dex_dir) {
-    // Collect app .class files
-    std::vector<std::string> class_files;
-    if (fs::exists(classes_dir)) {
-        for (const auto& entry : fs::recursive_directory_iterator(classes_dir)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".class")
-                class_files.push_back(entry.path().string());
-        }
-    }
-
-    if (class_files.empty()) {
-        phase_log("DEX_CONVERT", "No .class files — skipping DEX conversion");
-        return dex_dir;
-    }
-
-    if (env.d8.empty() || !fs::exists(env.d8)) {
-        fatal("DEX_CONVERT", err::DEX_001,
-              "d8 not found in build-tools",
-              env.build_tools_path.string());
-    }
-
+static std::string file_size_str(const fs::path& p) {
     std::error_code ec;
-    fs::create_directories(dex_dir, ec);
+    auto sz = fs::file_size(p, ec);
+    if (ec) return "? bytes";
+    if (sz >= 1024 * 1024) return std::to_string(sz / (1024 * 1024)) + " MB";
+    if (sz >= 1024) return std::to_string(sz / 1024) + " KB";
+    return std::to_string(sz) + " bytes";
+}
 
-    const std::string api_str   = std::to_string(cfg.min_sdk);
-    const fs::path    android_jar = env.sdk_path / "platforms"
-                                  / ("android-" + std::to_string(cfg.compile_sdk))
-                                  / "android.jar";
+static fs::path find_d8(const KineticEnv& env) {
+    for (auto&& p : {env.d8, env.build_tools_path / "d8"}) {
+        if (fs::exists(p)) return p;
+    }
+    fs::path from_path = fs::path(which("d8"));
+    if (!from_path.empty()) return from_path;
+    return {};
+}
 
-    // ── Check for kotlin-stdlib ───────────────────────────────────────────────
-    const bool has_kotlin_stdlib = !env.kotlin_stdlib.empty()
-                                && fs::exists(env.kotlin_stdlib);
-    if (!has_kotlin_stdlib) {
-        // Check if any .kt-derived class is present (META-INF/main.kotlin_module)
-        const fs::path kotlin_module = classes_dir / "META-INF" / "main.kotlin_module";
-        if (fs::exists(kotlin_module)) {
-            phase_warn("DEX_CONVERT",
-                "Kotlin classes detected but kotlin-stdlib.jar not found.\n"
-                "         The APK will crash at runtime with NoClassDefFoundError.\n"
-                "         Expected: " + (env.kotlinc_path.empty() ? "<kotlinc>/lib/" :
-                    fs::path(env.kotlinc_path).parent_path().parent_path().string()
-                    + "/lib/") + "kotlin-stdlib.jar");
-        }
+void PhaseDexConvert::execute(PhaseContext& ctx) {
+    if (ctx.no_dex) { phase_log("DEX_CONVERT", "--no-dex: skipping dex"); return; }
+
+    fs::path d8 = find_d8(ctx.env);
+    if (d8.empty()) fatal("DEX_CONVERT", err::DEX_001,
+        "d8 not found", "(in PATH)",
+        "Install Android build-tools: sdkmanager build-tools;"
+        + std::to_string(ctx.cfg.target_sdk));
+
+    ctx.timer.start("DEX_CONVERT");
+    phase_log("DEX_CONVERT", "Converting classes → classes.dex ...");
+
+    std::vector<fs::path> class_files;
+    for (const auto& e : fs::recursive_directory_iterator(ctx.dirs.classes_dir))
+        if (e.is_regular_file() && e.path().extension() == ".class")
+            class_files.push_back(e.path());
+
+    if (class_files.empty()) fatal("DEX_CONVERT", err::DEX_002,
+        "No .class files found in " + ctx.dirs.classes_dir.string(),
+        ctx.dirs.classes_dir.string(),
+        "Ensure java_sources / kotlin_sources are configured correctly");
+
+    std::vector<std::string> cmd = {
+        d8.string(),
+        "--min-api", std::to_string(ctx.cfg.min_sdk),
+        "--output", ctx.dirs.dex_dir.string()
+    };
+    for (const auto& cf : class_files) cmd.push_back(cf.string());
+
+    auto r = exec_proc(cmd, ctx.project_root);
+    if (r.exit_code != 0) {
+        ctx.timer.stop(false, "failed");
+        fatal("DEX_CONVERT", err::DEX_003,
+              "d8 failed to produce classes.dex",
+              ctx.dirs.dex_dir.string(),
+              r.err.empty() ? r.out : r.err);
     }
 
-    phase_log("DEX_CONVERT",
-              "Converting " + std::to_string(class_files.size()) + " .class files"
-              + (has_kotlin_stdlib ? " + kotlin-stdlib" : " (no kotlin-stdlib)")
-              + " → .dex ...");
+    fs::path dex = ctx.dirs.dex_dir / "classes.dex";
+    if (!fs::exists(dex)) fatal("DEX_CONVERT", err::DEX_002,
+        "classes.dex not found after d8 run",
+        ctx.dirs.dex_dir.string(),
+        "d8 exited with code 0 but did not create classes.dex");
 
-    std::vector<std::string> cmd;
-    cmd.push_back(env.d8.string());
-    cmd.push_back("--min-api"); cmd.push_back(api_str);
-    cmd.push_back("--output");  cmd.push_back(dex_dir.string());
-
-    // android.jar is a --lib (bootclasspath), NOT an input — its classes are
-    // already on-device and must NOT be dexed into our APK.
-    if (fs::exists(android_jar)) {
-        cmd.push_back("--lib"); cmd.push_back(android_jar.string());
-    }
-
-    // kotlin-stdlib IS an input — its classes must be dexed into classes.dex
-    // so they are available at runtime on the device.
-    if (has_kotlin_stdlib) {
-        cmd.push_back(env.kotlin_stdlib.string());
-        phase_log("DEX_CONVERT", "  + " + env.kotlin_stdlib.filename().string());
-    }
-
-    // App .class files
-    for (const auto& f : class_files) cmd.push_back(f);
-
-    auto result = exec_proc(cmd, project_root);
-    if (result.exit_code != 0) {
-        std::string detail = result.err.empty() ? result.out : result.err;
-        fatal("DEX_CONVERT", err::DEX_001,
-              "d8 dex conversion failed",
-              classes_dir.string(),
-              detail);
-    }
-
-    const fs::path dex_out = dex_dir / "classes.dex";
-    if (!fs::exists(dex_out)) {
-        fatal("DEX_CONVERT", err::DEX_002,
-              "classes.dex not produced by d8",
-              dex_dir.string());
-    }
-
-    // Report final dex size for awareness (kotlin-stdlib adds ~1.5 MB)
-    const auto dex_size = fs::file_size(dex_out);
-    phase_log("DEX_CONVERT",
-              "Done  → classes.dex  ("
-              + std::to_string(dex_size / 1024) + " KB)");
-    return dex_out;
+    auto sz = file_size_str(dex);
+    phase_log("DEX_CONVERT", "classes.dex → " + dex.string() + " (" + sz + ")");
+    ctx.timer.stop(true, "classes.dex (" + sz + ")");
 }
 
 } // namespace kinetic

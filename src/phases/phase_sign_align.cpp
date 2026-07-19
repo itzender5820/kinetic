@@ -1,8 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  phases/phase_sign_align.cpp  —  Phase 13: SIGN_ALIGN
-//
-//  Produces exactly ONE output file: <output_name>-signed.apk
-//  All intermediate files (unaligned, aligned-but-unsigned) are deleted.
 // ─────────────────────────────────────────────────────────────────────────────
 #include "phase_sign_align.hpp"
 #include "../error/error_reporter.hpp"
@@ -12,116 +9,124 @@
 
 namespace kinetic {
 
-// Delete a file if it exists (silently, used to clean intermediates)
-static void remove_if_exists(const fs::path& p) {
+static std::string file_size_str(const fs::path& p) {
     std::error_code ec;
-    if (fs::exists(p)) fs::remove(p, ec);
+    auto sz = fs::file_size(p, ec);
+    if (ec) return "? bytes";
+    if (sz >= 1024 * 1024) return std::to_string(sz / (1024 * 1024)) + " MB";
+    if (sz >= 1024) return std::to_string(sz / 1024) + " KB";
+    return std::to_string(sz) + " bytes";
 }
 
-fs::path phase_sign_align(const KineticConfig& cfg,
-                           const KineticEnv& env,
-                           const fs::path& project_root,
-                           const fs::path& apk_path) {
-    if (!fs::exists(apk_path)) {
-        fatal("SIGN_ALIGN", err::PKG_004,
-              "APK to sign not found", apk_path.string());
+static fs::path find_apksigner(const KineticEnv& env) {
+    for (auto&& p : {env.apksigner, env.build_tools_path / "apksigner"})
+        if (fs::exists(p)) return p;
+    fs::path from_path = fs::path(which("apksigner"));
+    if (!from_path.empty()) return from_path;
+    return {};
+}
+
+static fs::path find_zipalign(const KineticEnv& env) {
+    for (auto&& p : {env.zipalign, env.build_tools_path / "zipalign"})
+        if (fs::exists(p)) return p;
+    fs::path from_path = fs::path(which("zipalign"));
+    if (!from_path.empty()) return from_path;
+    return {};
+}
+
+static fs::path get_debug_keystore(const KineticConfig& cfg) {
+    if (!cfg.keystore.empty())
+        return cfg.keystore;
+    const char* home_c = std::getenv("HOME");
+    if (!home_c) return {};
+    fs::path home(home_c);
+    fs::path debug_ks = home / ".android" / "debug.keystore";
+    if (fs::exists(debug_ks)) return debug_ks;
+    fs::path kinetic_ks = home / ".kinetic" / "debug.keystore";
+    if (fs::exists(kinetic_ks)) return kinetic_ks;
+    fs::create_directories(kinetic_ks.parent_path());
+    std::string keytool_cmd =
+        "keytool -genkeypair -v -keystore \"" + kinetic_ks.string()
+        + "\" -alias androiddebugkey -storepass android -keypass android "
+        + "-keyalg RSA -keysize 2048 -validity 10000 "
+        + "-dname \"CN=Android Debug,O=Android,C=US\" 2>/dev/null";
+    int rc = std::system(keytool_cmd.c_str());
+    if (rc == 0 && fs::exists(kinetic_ks)) return kinetic_ks;
+    return {};
+}
+
+void PhaseSignAlign::execute(PhaseContext& ctx) {
+    ctx.timer.start("SIGN_ALIGN");
+
+    fs::path unsigned_apk = ctx.dirs.output_dir / (ctx.cfg.app_name + "-unsigned.apk");
+    if (!fs::exists(unsigned_apk)) fatal("SIGN_ALIGN", err::PKG_004,
+        "Unsigned APK not found", unsigned_apk.string(),
+        "Ensure APK_PACK phase completed");
+
+    fs::path zipalign = find_zipalign(ctx.env);
+    if (zipalign.empty()) fatal("SIGN_ALIGN", err::SGN_001,
+        "zipalign not found", "(in PATH)",
+        "Ensure ANDROID_HOME/build-tools/ is installed");
+
+    fs::path apksigner = find_apksigner(ctx.env);
+    if (apksigner.empty()) fatal("SIGN_ALIGN", err::SGN_002,
+        "apksigner not found", "(in PATH)",
+        "Ensure ANDROID_HOME/build-tools/ is installed");
+
+    fs::path aligned   = ctx.dirs.output_dir / (ctx.cfg.app_name + "-aligned.apk");
+    fs::path signed_apk = ctx.dirs.output_dir / (ctx.cfg.app_name + "-signed.apk");
+
+    fs::path keystore = get_debug_keystore(ctx.cfg);
+    if (keystore.empty()) fatal("SIGN_ALIGN", err::SGN_003,
+        "Keystore not found", "~/.android/debug.keystore",
+        "Either configure signing_keystore or install Android Studio");
+
+    auto align = exec_proc({zipalign.string(), "-f", "4",
+        unsigned_apk.string(), aligned.string()}, ctx.project_root);
+    if (align.exit_code != 0) {
+        ctx.timer.stop(false, "failed");
+        fatal("SIGN_ALIGN", err::SGN_004,
+              "zipalign failed", aligned.string(),
+              align.err.empty() ? align.out : align.err);
     }
+    phase_log("SIGN_ALIGN", "zipalign → " + aligned.string());
 
-    const fs::path output_dir  = apk_path.parent_path();
-    const std::string base     = cfg.output_name;
+    std::string ks_pass = ctx.cfg.store_password.empty() ? "android"
+                        : ctx.cfg.store_password;
+    std::string key_pass = ctx.cfg.key_password.empty() ? "android"
+                         : ctx.cfg.key_password;
+    std::string key_alias = ctx.cfg.key_alias.empty() ? "androiddebugkey"
+                          : ctx.cfg.key_alias;
 
-    // All paths derived from the base name — makes it easy to track and clean
-    const fs::path aligned_apk = output_dir / (base + "-aligned.apk");
-    const fs::path signed_apk  = output_dir / (base + "-signed.apk");
-
-    // ── Clean any leftover files from previous builds ─────────────────────────
-    remove_if_exists(aligned_apk);
-    remove_if_exists(signed_apk);
-    // Also remove any stale .idsig from a previous apksigner run
-    remove_if_exists(fs::path(signed_apk.string() + ".idsig"));
-
-    // ── Step 1: zipalign ─────────────────────────────────────────────────────
-    fs::path to_sign = apk_path;  // default: sign the raw APK if zipalign absent
-
-    if (!env.zipalign.empty() && fs::exists(env.zipalign)) {
-        phase_log("SIGN_ALIGN", "zipalign  →  " + aligned_apk.filename().string());
-
-        auto r = exec_proc({
-            env.zipalign.string(),
-            "-f", "-v", "4",
-            apk_path.string(),
-            aligned_apk.string()
-        }, project_root);
-
-        if (r.exit_code != 0) {
-            std::string detail = r.err.empty() ? r.out : r.err;
-            fatal("SIGN_ALIGN", err::SGN_003, "zipalign failed",
-                  aligned_apk.string(), detail);
-        }
-        to_sign = aligned_apk;
-    } else {
-        phase_warn("SIGN_ALIGN", "zipalign not found — skipping alignment step");
-    }
-
-    // ── Step 2: apksigner ────────────────────────────────────────────────────
-    if (env.apksigner.empty() || !fs::exists(env.apksigner)) {
-        phase_warn("SIGN_ALIGN", "apksigner not found — APK will be unsigned");
-        // Rename/move to the canonical signed name so downstream always has one file
-        std::error_code ec;
-        fs::rename(to_sign, signed_apk, ec);
-        if (ec) {
-            // rename across filesystems can fail — fall back to copy+delete
-            fs::copy_file(to_sign, signed_apk, fs::copy_options::overwrite_existing, ec);
-            if (!ec) fs::remove(to_sign, ec);
-        }
-        return signed_apk;
-    }
-
-    // Expand ~ in keystore path
-    std::string keystore_path = cfg.keystore;
-    if (!keystore_path.empty() && keystore_path[0] == '~') {
-        const char* home = std::getenv("HOME");
-        if (home) keystore_path = std::string(home) + keystore_path.substr(1);
-    }
-
-    if (!fs::exists(keystore_path)) {
-        fatal("SIGN_ALIGN", err::SGN_001,
-              "Keystore not found: " + keystore_path, keystore_path);
-    }
-
-    phase_log("SIGN_ALIGN", "Signing with " + fs::path(keystore_path).filename().string() + " ...");
-
-    auto r = exec_proc({
-        env.apksigner.string(),
-        "sign",
-        "--ks",            keystore_path,
-        "--ks-key-alias",  cfg.key_alias,
-        "--ks-pass",       "pass:" + cfg.store_password,
-        "--key-pass",      "pass:" + cfg.key_password,
-        "--out",           signed_apk.string(),
-        to_sign.string()
-    }, project_root);
-
-    if (r.exit_code != 0) {
-        std::string detail = r.err.empty() ? r.out : r.err;
-        fatal("SIGN_ALIGN", err::SGN_002, "apksigner failed",
-              keystore_path, detail);
-    }
-
-    if (!fs::exists(signed_apk)) {
+    auto sign = exec_proc({apksigner.string(), "sign",
+        "--ks", keystore.string(),
+        "--ks-pass", "pass:" + ks_pass,
+        "--key-pass", "pass:" + key_pass,
+        "--ks-key-alias", key_alias,
+        "--out", signed_apk.string(),
+        aligned.string()}, ctx.project_root);
+    if (sign.exit_code != 0) {
+        ctx.timer.stop(false, "failed");
         fatal("SIGN_ALIGN", err::SGN_002,
-              "Signed APK not produced", signed_apk.string());
+              "apksigner sign failed", signed_apk.string(),
+              sign.err.empty() ? sign.out : sign.err);
+    }
+    phase_log("SIGN_ALIGN", "apksigner → " + signed_apk.string());
+
+    auto verify = exec_proc({apksigner.string(), "verify",
+        "--verbose", signed_apk.string()}, ctx.project_root);
+    if (verify.exit_code != 0) {
+        phase_warn("SIGN_ALIGN", "apksigner verify failed: "
+            + (verify.err.empty() ? verify.out : verify.err));
     }
 
-    // ── Clean up intermediates ────────────────────────────────────────────────
-    // Remove the raw unsigned APK (testapp-debug.apk) — only keep the signed one
-    if (apk_path != signed_apk) remove_if_exists(apk_path);
-    // Remove aligned-but-unsigned intermediate
-    if (to_sign != signed_apk && to_sign != apk_path) remove_if_exists(to_sign);
+    std::error_code ec;
+    fs::remove(aligned, ec);
+    fs::remove(unsigned_apk, ec);
 
-    phase_log("SIGN_ALIGN", "Done  → " + signed_apk.filename().string()
-              + "  (signed + aligned)");
-    return signed_apk;
+    auto sz = file_size_str(signed_apk);
+    phase_log("SIGN_ALIGN", "Final APK → " + signed_apk.string() + " (" + sz + ")");
+    ctx.timer.stop(true, ctx.cfg.app_name + "-signed.apk (" + sz + ")");
 }
 
 } // namespace kinetic

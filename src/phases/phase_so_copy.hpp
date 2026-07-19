@@ -1,14 +1,32 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  phases/phase_so_copy.hpp  —  Phase 09: SO_COPY
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma once
-#include "../config/config_model.hpp"
-#include "../env/env_scanner.hpp"
-#include <filesystem>
-#include <vector>
+#include "../dag/phase.hpp"
+
 namespace kinetic {
-namespace fs = std::filesystem;
-// Phase 09: Copy compiled .so files into staging lib/<abi>/ directories
-int phase_so_copy(const KineticConfig& cfg,
-                  const KineticEnv& env,
-                  const fs::path& project_root,
-                  const fs::path& lib_dir,
-                  const fs::path& staging_dir);
+
+class PhaseSoCopy final : public Phase {
+public:
+    const char* name() const override { return "SO_COPY"; }
+
+    std::vector<std::string> requires() const override {
+        return {"NDK_COMPILE"};
+    }
+
+    std::vector<fs::path> provides(const PhaseContext& ctx) const override {
+        std::vector<fs::path> out;
+        for (const auto& abi : ctx.cfg.abi_filters) {
+            fs::path dst = ctx.dirs.staging_dir / "lib" / abi / "libkinetic.so";
+            out.push_back(dst);
+        }
+        return out;
+    }
+
+    bool parallelizable() const override { return true; }
+    bool cacheable()      const override { return true; }
+
+    void execute(PhaseContext& ctx) override;
+};
+
 } // namespace kinetic

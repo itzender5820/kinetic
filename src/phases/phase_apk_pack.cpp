@@ -1,6 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  phases/phase_apk_pack.cpp  —  Phase 12: APK_PACK
-//  Package the distributable APK using the aarch64 system AAPT2
 // ─────────────────────────────────────────────────────────────────────────────
 #include "phase_apk_pack.hpp"
 #include "../error/error_reporter.hpp"
@@ -10,115 +9,109 @@
 
 namespace kinetic {
 
-fs::path phase_apk_pack(const KineticConfig& cfg,
-                         const KineticEnv& env,
-                         const fs::path& project_root,
-                         const fs::path& staging_dir,
-                         const fs::path& aprs_path,
-                         const fs::path& dex_dir,
-                         const fs::path& output_dir) {
-    std::error_code ec;
-    fs::create_directories(output_dir, ec);
+static fs::path find_aapt2(const KineticEnv& env) {
+    for (auto&& p : {env.sdk_aapt2, env.build_tools_path / "aapt2"})
+        if (fs::exists(p)) return p;
+    fs::path from_path = fs::path(which("aapt2"));
+    if (!from_path.empty()) return from_path;
+    return {};
+}
 
-    fs::path apk_out = output_dir / (cfg.output_name + ".apk");
+void PhaseApkPack::execute(PhaseContext& ctx) {
+    const fs::path dex       = ctx.dirs.dex_dir / "classes.dex";
+    const fs::path stg       = ctx.dirs.staging_dir;
+    const fs::path manifest  = stg / "AndroidManifest.xml";
+    const fs::path res_dir   = ctx.dirs.aprs_dir;
 
-    // Remove any APK from a previous build so we start fresh
-    { std::error_code _ec; if (fs::exists(apk_out)) fs::remove(apk_out, _ec); }
-    phase_log("APK_PACK", "Packaging " + cfg.output_name + ".apk ...");
+    ctx.timer.start("APK_PACK");
 
-    // aapt2 package: use the aarch64 system aapt2 for the final APK
-    fs::path manifest = staging_dir / "AndroidManifest.xml";
-    if (!fs::exists(manifest)) {
-        fatal("APK_PACK", err::PKG_002,
-              "AndroidManifest.xml missing from staging",
-              manifest.string());
-    }
+    // Validate all inputs exist
+    if (!fs::exists(manifest)) fatal("APK_PACK", err::PKG_001,
+        "staging/AndroidManifest.xml not found",
+        manifest.string(),
+        "Ensure MANIFEST_MERGE phase has run");
+    if (!fs::exists(dex))      fatal("APK_PACK", err::PKG_002,
+        "intermediates/dex/classes.dex not found",
+        dex.string(),
+        "Ensure DEX_CONVERT phase has run");
 
-    std::string api_str = std::to_string(cfg.compile_sdk);
-    fs::path android_jar = env.sdk_path / "platforms"
-                         / ("android-" + api_str) / "android.jar";
+    fs::path aapt2 = find_aapt2(ctx.env);
+    if (aapt2.empty()) fatal("APK_PACK", err::PKG_003,
+        "aapt2 not found in $PATH or $ANDROID_HOME/build-tools/",
+        "(in PATH)",
+        "Ensure ANDROID_HOME is set and build-tools are installed");
 
-    // Collect .flat files again (for package phase using sys aapt2)
-    std::vector<std::string> extra_args;
+    fs::create_directories(ctx.dirs.output_dir);
 
-    // Add dex file if present
-    fs::path dex_file = dex_dir / "classes.dex";
+    std::string unsigned_name = ctx.cfg.app_name + "-unsigned.apk";
+    fs::path out = ctx.dirs.output_dir / unsigned_name;
 
-    // Build aapt2 link command for final APK packaging
-    std::vector<std::string> cmd;
-    cmd.push_back(env.sys_aapt2.string());
-    cmd.push_back("link");
-    cmd.push_back("-o"); cmd.push_back(apk_out.string());
-    cmd.push_back("-I"); cmd.push_back(android_jar.string());
-    cmd.push_back("--manifest"); cmd.push_back(manifest.string());
-    cmd.push_back("--min-sdk-version"); cmd.push_back(std::to_string(cfg.min_sdk));
-    cmd.push_back("--target-sdk-version"); cmd.push_back(std::to_string(cfg.target_sdk));
-    cmd.push_back("--version-code"); cmd.push_back(std::to_string(cfg.version_code));
-    cmd.push_back("--version-name"); cmd.push_back(cfg.version_name);
-    cmd.push_back("--auto-add-overlay");
+    std::vector<std::string> cmd = {
+        aapt2.string(), "link", "--manifest", manifest.string(),
+        "-I", (ctx.env.sdk_path / "platforms" / std::to_string(ctx.cfg.target_sdk)
+               / "android.jar").string(),
+        "-o", out.string()
+    };
 
-    // Always gather and use all .flat files directly.
-    // The pre-linked .aprs produced by SDK aapt2 (Phase 04) is a linked APK (ZIP),
-    // which aapt2 link -R does NOT accept (it expects magic 'AAPT').
-    fs::path flat_dir = project_root / "build" / "intermediates" / "flat";
-    if (fs::exists(flat_dir)) {
-        for (const auto& entry : fs::recursive_directory_iterator(flat_dir)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".flat") {
-                cmd.push_back(entry.path().string());
+    if (fs::exists(res_dir) && !fs::is_empty(res_dir)) {
+        for (const auto& flat : fs::directory_iterator(res_dir)) {
+            if (flat.path().extension() == ".flat") {
+                cmd.push_back("-R");
+                cmd.push_back(flat.path().string());
             }
         }
     }
 
-    // Include staging directory as an additional overlay directory
-    cmd.push_back("--java"); cmd.push_back((output_dir / "gen").string());
+    cmd.push_back("--auto-add-overlay");
 
-    auto result = exec_proc(cmd, project_root);
-    if (result.exit_code != 0) {
-        std::string detail = result.err.empty() ? result.out : result.err;
+    auto r = exec_proc(cmd, ctx.project_root);
+    if (r.exit_code != 0) {
+        ctx.timer.stop(false, "failed");
         fatal("APK_PACK", err::PKG_001,
-              "aapt2 package failed",
-              apk_out.string(),
-              detail);
+              "aapt2 link failed", out.string(),
+              r.err.empty() ? r.out : r.err);
     }
 
-    // If APK was produced, manually add native libs, dex, and assets using zip
-    // since aapt2 link handles resources but we need to add the compiled artifacts.
-    // We use the 'zip' command-line tool available on all POSIX systems.
-    if (!fs::exists(apk_out)) {
-        fatal("APK_PACK", err::PKG_004,
-              "APK not produced by aapt2",
-              apk_out.string());
-    }
+    phase_log("APK_PACK", "Unpacked APK: " + out.string());
 
-    // Add classes.dex
-    if (fs::exists(dex_file)) {
-        auto r = exec_proc({"zip", "-j", apk_out.string(), dex_file.string()}, output_dir);
-        if (r.exit_code != 0) {
-            phase_warn("APK_PACK", "Failed to add classes.dex to APK");
-        }
-    }
+    // Use zip to add dex, assets, libs
+    auto zip_rm = exec_proc({"/bin/bash", "-c",
+        "cd \"" + out.parent_path().string() + "\" && "
+        "rm -rf _apk_work && mkdir -p _apk_work"}, ctx.project_root);
+    if (zip_rm.exit_code != 0) fatal("APK_PACK", err::PKG_004,
+        "Failed to create APK staging dir", out.parent_path().string(),
+        zip_rm.err.empty() ? zip_rm.out : zip_rm.err);
 
-    // Add lib/ tree (native .so files)
-    fs::path lib_staging = staging_dir / "lib";
-    if (fs::exists(lib_staging)) {
-        // zip -r apk.apk lib/
-        auto r = exec_proc({"zip", "-r", apk_out.string(), "lib"}, staging_dir);
-        if (r.exit_code != 0) {
-            phase_warn("APK_PACK", "Failed to add native libs to APK");
-        }
-    }
+    auto zip_add = exec_proc({"/bin/bash", "-c",
+        "cd \"" + out.parent_path().string() + "/_apk_work\" && "
+        "unzip -qo \"" + out.string() + "\" 2>/dev/null || true && "
+        "cp -f \"" + dex.string() + "\" classes.dex && "
+        "if [ -d \"" + stg.string() + "/assets\" ]; then "
+        "  mkdir -p assets && cp -rf \"" + stg.string() + "/assets/\"* assets/ 2>/dev/null; "
+        "fi && "
+        "if [ -d \"" + stg.string() + "/lib\" ]; then "
+        "  mkdir -p lib && cp -rf \"" + stg.string() + "/lib/\"* lib/ 2>/dev/null; "
+        "fi"}, ctx.project_root);
+    if (zip_add.exit_code != 0) fatal("APK_PACK", err::PKG_004,
+        "Failed to add resources to APK staging",
+        out.parent_path().string(),
+        zip_add.err.empty() ? zip_add.out : zip_add.err);
 
-    // Add assets/ tree
-    fs::path assets_staging = staging_dir / "assets";
-    if (fs::exists(assets_staging)) {
-        auto r = exec_proc({"zip", "-r", apk_out.string(), "assets"}, staging_dir);
-        if (r.exit_code != 0) {
-            phase_warn("APK_PACK", "Failed to add assets to APK");
-        }
-    }
+    auto zip_repack = exec_proc({"/bin/bash", "-c",
+        "cd \"" + out.parent_path().string() + "/_apk_work\" && "
+        "rm -f \"" + out.string() + "\" && "
+        "zip -r -q \"" + out.string() + "\" ."}, ctx.project_root);
+    if (zip_repack.exit_code != 0) fatal("APK_PACK", err::PKG_004,
+        "Failed to repackage APK",
+        out.string(),
+        zip_repack.err.empty() ? zip_repack.out : zip_repack.err);
 
-    phase_log("APK_PACK", "Done  → " + cfg.output_name + ".apk");
-    return apk_out;
+    auto zip_clean = exec_proc({"/bin/bash", "-c",
+        "rm -rf \"" + out.parent_path().string() + "/_apk_work\""},
+        ctx.project_root);
+
+    phase_log("APK_PACK", "Raw APK (unsigned, uncompressed): " + out.string());
+    ctx.timer.stop(true, unsigned_name);
 }
 
 } // namespace kinetic

@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
-project(kinetic VERSION 1.0.0 LANGUAGES CXX)
+project(kinetic VERSION 2.0.0 LANGUAGES C CXX)
 
+# ── C standard ──────────────────────────────────────────────────────────────
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+# ── C++ standard ────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -10,15 +16,33 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -Wall -Wextra")
+set(CMAKE_C_FLAGS_RELEASE   "-O2 -Wall -Wextra -Wpedantic")
+set(CMAKE_C_FLAGS_DEBUG     "-g -O0 -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -Wall -Wextra -Wpedantic")
 
-# ── Source files ──────────────────────────────────────────────────────────────
-set(KINETIC_SOURCES
-    src/main.cpp
+# ── C sources (universal-ABI core) ──────────────────────────────────────────
+set(KINETIC_C_SOURCES
+    src/main.c
+
+    src/c/color.c
+    src/c/kinetic_c.c
+
+    src/utils/sha256_c.c
+    src/utils/process_c.c
+
+    src/error/error_c.c
+)
+
+# ── C++ sources (engine, DAG, phases, config) ───────────────────────────────
+set(KINETIC_CXX_SOURCES
+    src/kinetic.cpp
+    src/bridge.cpp
 
     src/utils/process.cpp
     src/utils/sha256.cpp
+    src/copy/file_copier.cpp
+    src/copy/essential_manifest.cpp
 
     src/error/error_reporter.cpp
 
@@ -30,11 +54,15 @@ set(KINETIC_SOURCES
 
     src/core/phase_timer.cpp
     src/core/telemetry.cpp
+    src/core/phase_registry.cpp
     src/core/engine.cpp
 
-    src/copy/file_copier.cpp
-    src/copy/essential_manifest.cpp
+    src/dag/dag.cpp
+    src/dag/fshasher.cpp
+    src/dag/executor.cpp
 
+    src/phases/phase_env_scan.cpp
+    src/phases/phase_cmake_parse.cpp
     src/phases/phase_res_compile.cpp
     src/phases/phase_link_aprs.cpp
     src/phases/phase_ndk_compile.cpp
@@ -51,7 +79,7 @@ set(KINETIC_SOURCES
     src/cli/help_printer.cpp
 )
 
-add_executable(kinetic ${KINETIC_SOURCES})
+add_executable(kinetic ${KINETIC_C_SOURCES} ${KINETIC_CXX_SOURCES})
 
 target_include_directories(kinetic PRIVATE src)
 
@@ -66,11 +94,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(kinetic PRIVATE KINETIC_LINUX)
 endif()
 
+# pthread is required by both the C++ DAG executor and the C process module
+find_package(Threads REQUIRED)
+target_link_libraries(kinetic PRIVATE Threads::Threads)
+
 # Filesystem linking (GCC < 9 needs explicit -lstdc++fs)
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_link_libraries(kinetic stdc++fs pthread)
-else()
-    target_link_libraries(kinetic pthread)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(kinetic PRIVATE stdc++fs)
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -87,8 +117,6 @@ set_target_properties(kinetic PROPERTIES
 )
 
 # ── Copy assets/ into dist/ so the binary finds them next to itself ────────────
-# chmod +x is required: cmake -E copy_directory does NOT preserve the executable
-# bit on all platforms, and tar extraction often strips it too.
 add_custom_command(TARGET kinetic POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/assets"

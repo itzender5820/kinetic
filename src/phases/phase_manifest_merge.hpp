@@ -1,12 +1,27 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  phases/phase_manifest_merge.hpp  —  Phase 11: MANIFEST_MERGE
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma once
-#include "../config/config_model.hpp"
-#include "../env/env_scanner.hpp"
-#include <filesystem>
+#include "../dag/phase.hpp"
+
 namespace kinetic {
-namespace fs = std::filesystem;
-// Phase 11: Validate and copy AndroidManifest.xml into staging
-fs::path phase_manifest_merge(const KineticConfig& cfg,
-                               const KineticEnv& env,
-                               const fs::path& project_root,
-                               const fs::path& staging_dir);
+
+class PhaseManifestMerge final : public Phase {
+public:
+    const char* name() const override { return "MANIFEST_MERGE"; }
+
+    std::vector<std::string> requires() const override {
+        return {"CMAKE_PARSE"};
+    }
+
+    std::vector<fs::path> provides(const PhaseContext& ctx) const override {
+        return {ctx.dirs.staging_dir / "AndroidManifest.xml"};
+    }
+
+    bool parallelizable() const override { return true; }
+    bool cacheable()      const override { return true; }
+
+    void execute(PhaseContext& ctx) override;
+};
+
 } // namespace kinetic

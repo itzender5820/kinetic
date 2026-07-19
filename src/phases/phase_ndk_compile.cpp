@@ -6,213 +6,114 @@
 #include "../error/error_codes.hpp"
 #include "../utils/process.hpp"
 #include "../kinetic.hpp"
-
-#include <sstream>
+#include <algorithm>
+#include <thread>
 
 namespace kinetic {
 
-// ABI → NDK target triple mapping
-static std::string abi_to_triple(const std::string& abi) {
-    if (abi == "arm64-v8a")   return "aarch64-linux-android";
-    if (abi == "armeabi-v7a") return "armv7a-linux-androideabi";
-    if (abi == "x86_64")      return "x86_64-linux-android";
-    if (abi == "x86")         return "i686-linux-android";
-    return "aarch64-linux-android";
+static std::string find_cmake() {
+    std::string found = which("cmake");
+    if (!found.empty() && fs::exists(found)) return found;
+    for (auto&& s : {"/usr/bin/cmake", "/usr/local/bin/cmake"}) {
+        if (fs::exists(s)) return s;
+    }
+    return {};
 }
 
-// Find the correct versioned clang++ for a given ABI and API level
-static fs::path find_clangxx(const KineticEnv& env,
-                              const std::string& abi,
-                              int api) {
-    fs::path llvm = env.ndk_path / "toolchains" / "llvm" / "prebuilt";
-    fs::path prebuilt_host;
-    for (const auto& e : fs::directory_iterator(llvm)) {
-        if (e.is_directory()) { prebuilt_host = e.path(); break; }
-    }
-    if (prebuilt_host.empty()) return env.ndk_clangxx;
+void PhaseNdkCompile::execute(PhaseContext& ctx) {
+    const fs::path native_dir   = ctx.project_root / "src" / "main" / "cpp";
+    const fs::path build_sub    = ctx.dirs.build_dir / "cmake_build";
 
-    fs::path bin = prebuilt_host / "bin";
-    std::string triple = abi_to_triple(abi);
-    std::string api_str = std::to_string(api);
+    ctx.timer.start("NDK_COMPILE");
 
-    // armeabi-v7a uses armv7a triple but android prefix
-    if (abi == "armeabi-v7a") triple = "armv7a-linux-androideabi";
-
-    fs::path candidate = bin / (triple + api_str + "-clang++");
-    if (fs::exists(candidate)) return candidate;
-
-    candidate = bin / (triple + "-clang++");
-    if (fs::exists(candidate)) return candidate;
-
-    return env.ndk_clangxx;
-}
-
-// Compile a single source file → .o
-static fs::path compile_source(const fs::path& src_file,
-                                const fs::path& obj_dir,
-                                const fs::path& clangxx,
-                                const KineticConfig& cfg,
-                                const KineticEnv& env,
-                                const std::string& abi,
-                                const fs::path& project_root) {
-    // Build .o path mirroring source layout
-    fs::path rel = src_file.is_absolute()
-                   ? fs::relative(src_file, project_root)
-                   : src_file;
-    fs::path obj_path = obj_dir / abi / (rel.string() + ".o");
-    fs::create_directories(obj_path.parent_path());
-
-    std::vector<std::string> cmd;
-    cmd.push_back(clangxx.string());
-
-    // C or C++?
-    auto ext = src_file.extension().string();
-    bool is_c = (ext == ".c");
-
-    if (!is_c) {
-        cmd.push_back("-std=c++" + std::to_string(cfg.cpp_standard));
+    // Validate native source exists
+    if (!fs::exists(native_dir)) {
+        phase_warn("NDK_COMPILE",
+            "src/main/cpp/ not found — skipping NDK compile");
+        ctx.timer.stop(true, "skipped (no native source)");
+        return;
     }
 
-    // Parse and append cpp_flags
-    {
-        std::istringstream ss(cfg.cpp_flags);
-        std::string tok;
-        while (ss >> tok) cmd.push_back(tok);
-    }
+    fs::path cmake = find_cmake();
+    if (cmake.empty()) fatal("NDK_COMPILE", err::NDK_001,
+        "cmake not found in $PATH or /usr/bin/",
+        "(in PATH)", "Install CMake: brew install cmake");
 
-    // Every object going into a .so must be position-independent.
-    // -fPIC on the compile command is mandatory; -fPIC on the link step alone
-    // is insufficient and produces R_AARCH64_ADR_PREL_PG_HI21 relocation errors.
-    cmd.push_back("-fPIC");
+    fs::path ndk_root = ctx.env.ndk_path;
+    if (!fs::exists(ndk_root)) fatal("NDK_COMPILE", err::NDK_002,
+        "NDK home not found", ndk_root.string(),
+        "Install the NDK via sdkmanager");
 
-    // Target triple encodes the API level (e.g. aarch64-linux-android24).
-    // Clang derives __ANDROID_API__ from --target automatically.
-    cmd.push_back("--target=" + abi_to_triple(abi) + std::to_string(cfg.min_sdk));
+    fs::path android_jar = ctx.env.sdk_path / "platforms"
+                         / std::to_string(ctx.cfg.target_sdk) / "android.jar";
+    fs::path ke = ctx.project_root / "ke";
 
-    // Sysroot
-    cmd.push_back("--sysroot=" + env.ndk_sysroot.string());
+    phase_log("NDK_COMPILE",
+        "Generating CMake project with NDK → " + ndk_root.string());
 
-    // Include directories
-    for (const auto& inc : cfg.include_dirs) {
-        fs::path inc_path = project_root / inc;
-        cmd.push_back("-I" + inc_path.string());
-    }
-    // NDK unified headers
-    cmd.push_back("-I" + (env.ndk_sysroot / "usr" / "include").string());
+    fs::create_directories(build_sub);
 
-    cmd.push_back("-c");
-    cmd.push_back(src_file.is_absolute() ? src_file.string()
-                                         : (project_root / src_file).string());
-    cmd.push_back("-o");
-    cmd.push_back(obj_path.string());
+    // Generate with -DCMAKE_TOOLCHAIN_FILE and all flags
+    std::vector<std::string> gen_cmd = {
+        cmake.string(),
+        "-S", native_dir.string(),
+        "-B", build_sub.string(),
+        "-DCMAKE_TOOLCHAIN_FILE=" + ndk_root.string() + "/build/cmake/android.toolchain.cmake",
+        "-DANDROID_ABI=" + ctx.cfg.abi_filters[0],
+        "-DANDROID_PLATFORM=android-" + std::to_string(ctx.cfg.min_sdk),
+        "-DANDROID_STL=c++_shared",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        "-DCMAKE_C_FLAGS=-fPIC",
+        "-DCMAKE_CXX_FLAGS=-fPIC",
+        "-DKINETIC_PROJECT_DIR=" + ctx.project_root.string(),
+        "-DKINETIC_JAR=" + android_jar.string(),
+        "-DKETC=" + ke.string(),
+        "-DKETC_ANDROID_API=" + std::to_string(ctx.cfg.min_sdk),
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+    };
 
-    phase_log("NDK_COMPILE", (is_c ? "clang " : "clang++ ")
-              + src_file.filename().string() + "  [" + abi + "]");
-
-    auto result = exec_proc(cmd, project_root);
-    if (result.exit_code != 0) {
-        std::string detail = result.err.empty() ? result.out : result.err;
+    auto gen = exec_proc(gen_cmd, ctx.project_root);
+    if (gen.exit_code != 0) {
+        ctx.timer.stop(false, "failed (generate)");
         fatal("NDK_COMPILE", err::NDK_003,
-              "Compilation failed: " + src_file.filename().string(),
-              src_file.string(),
-              detail);
-    }
-    return obj_path;
-}
-
-// Link .o files → shared library
-static fs::path link_shared(const std::vector<fs::path>& obj_files,
-                              const fs::path& lib_dir,
-                              const fs::path& clangxx,
-                              const KineticConfig& cfg,
-                              const KineticEnv& env,
-                              const std::string& abi,
-                              const fs::path& project_root) {
-    // Derive library name from app_name
-    std::string lib_name = "lib" + cfg.app_name + ".so";
-    fs::path out_so = lib_dir / abi / lib_name;
-    fs::create_directories(out_so.parent_path());
-
-    std::vector<std::string> cmd;
-    cmd.push_back(clangxx.string());
-    cmd.push_back("-shared");
-    cmd.push_back("-fPIC");
-
-    // ── 16KB page size support (required for Android 15+ devices) ──────────
-    // -z max-page-size=16384 aligns ELF LOAD segments to 16KB boundaries.
-    // Without this flag, apps crash on devices with 16KB page granules
-    // (Pixel 9 and later with CONFIG_ARM64_4K_PAGES=n kernels).
-    // The flag is safe on 4KB-page devices — it just wastes a few KB of padding.
-    cmd.push_back("-Wl,-z,max-page-size=16384");
-    cmd.push_back("--target=" + abi_to_triple(abi) + std::to_string(cfg.min_sdk));
-    cmd.push_back("--sysroot=" + env.ndk_sysroot.string());
-
-    for (const auto& obj : obj_files) cmd.push_back(obj.string());
-
-    // NDK system lib dirs
-    cmd.push_back("-L" + (env.ndk_sysroot / "usr" / "lib"
-                           / (abi_to_triple(abi) + std::to_string(cfg.min_sdk))).string());
-
-    for (const auto& lib : cfg.link_libs) {
-        cmd.push_back("-l" + lib);
+              "CMake generate failed",
+              build_sub.string(), gen.err.empty() ? gen.out : gen.err);
     }
 
-    cmd.push_back("-o"); cmd.push_back(out_so.string());
+    phase_log("NDK_COMPILE", "Building native .so files ...");
 
-    phase_log("NDK_COMPILE", "Linking → " + lib_name + "  [" + abi + "]");
-
-    auto result = exec_proc(cmd, project_root);
-    if (result.exit_code != 0) {
-        std::string detail = result.err.empty() ? result.out : result.err;
-        fatal("NDK_COMPILE", err::NDK_004,
-              "Linker error: " + lib_name,
-              out_so.string(),
-              detail);
-    }
-    return out_so;
-}
-
-// ── Public entry point ────────────────────────────────────────────────────────
-std::vector<fs::path> phase_ndk_compile(const KineticConfig& cfg,
-                                         const KineticEnv& env,
-                                         const fs::path& project_root,
-                                         const fs::path& obj_dir,
-                                         const fs::path& lib_dir) {
-    if (cfg.sources.empty()) {
-        phase_log("NDK_COMPILE", "No C++ sources — skipping NDK compile");
-        return {};
-    }
-
-    std::vector<fs::path> all_sos;
-
-    for (const auto& abi : cfg.abi_filters) {
-        phase_log("NDK_COMPILE", "ABI: " + abi);
-
-        fs::path clangxx = find_clangxx(env, abi, cfg.min_sdk);
-        phase_log("NDK_COMPILE", "Compiler → " + clangxx.filename().string());
-
-        // Compile each source
-        std::vector<fs::path> obj_files;
-        for (const auto& src : cfg.sources) {
-            fs::path src_path = project_root / src;
-            if (!fs::exists(src_path)) {
-                fatal("NDK_COMPILE", err::NDK_002,
-                      "Source file not found: " + src,
-                      src_path.string(),
-                      "Verify path in KINETIC_SOURCES in kinetic.cmake");
-            }
-            obj_files.push_back(
-                compile_source(src_path, obj_dir, clangxx, cfg, env, abi, project_root)
-            );
+    // Build each ABI
+    for (const auto& abi : ctx.cfg.abi_filters) {
+        phase_log("NDK_COMPILE", "ABI " + abi + " ...");
+        std::vector<std::string> build_cmd = {
+            cmake.string(),
+            "--build", build_sub.string(),
+            "--target", "kinetic",
+            "-j", std::to_string(std::max(1u, std::thread::hardware_concurrency() / 2))
+        };
+        auto build = exec_proc(build_cmd, ctx.project_root);
+        if (build.exit_code != 0) {
+            ctx.timer.stop(false, "failed (build)");
+            fatal("NDK_COMPILE", err::NDK_004,
+                  "NDK build failed for ABI " + abi,
+                  build_sub.string(),
+                  build.err.empty() ? build.out : build.err);
         }
 
-        // Link into shared library
-        fs::path so = link_shared(obj_files, lib_dir, clangxx, cfg, env, abi, project_root);
-        all_sos.push_back(so);
-        phase_log("NDK_COMPILE", "Done  → " + so.filename().string());
+        // Copy output .so → lib/<abi>/
+        fs::path abi_lib_dir = ctx.dirs.lib_dir / abi;
+        fs::create_directories(abi_lib_dir);
+
+        fs::path so_file = build_sub / "libkinetic.so";
+        if (fs::exists(so_file)) {
+            fs::copy_file(so_file, abi_lib_dir / "libkinetic.so",
+                         fs::copy_options::overwrite_existing);
+        }
     }
 
-    return all_sos;
+    phase_log("NDK_COMPILE", "Native build complete.");
+    ctx.timer.stop(true, "native .so files built");
 }
 
 } // namespace kinetic

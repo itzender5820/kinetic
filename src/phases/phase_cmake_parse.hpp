@@ -1,24 +1,23 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  phases/phase_link_aprs.hpp  —  Phase 04: LINK_APRS
+//  phases/phase_cmake_parse.hpp  —  Phase 02: CMAKE_PARSE
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 #include "../dag/phase.hpp"
 
 namespace kinetic {
 
-class PhaseLinkAprs final : public Phase {
+class PhaseCmakeParse final : public Phase {
 public:
-    const char* name() const override { return "LINK_APRS"; }
+    const char* name() const override { return "CMAKE_PARSE"; }
 
-    std::vector<std::string> requires() const override {
-        return {"RES_COMPILE"};
+    std::vector<std::string> requires() const override { return {"ENV_SCAN"}; }
+
+    std::vector<fs::path> provides(const PhaseContext&) const override {
+        return {};
     }
 
-    std::vector<fs::path> provides(const PhaseContext& ctx) const override {
-        return {ctx.dirs.aprs_dir / "resources.aprs"};
-    }
-
-    bool cacheable() const override { return true; }
+    bool parallelizable() const override { return false; }
+    bool cacheable()     const override { return false; }
 
     void execute(PhaseContext& ctx) override;
 };

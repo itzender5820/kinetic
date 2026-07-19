@@ -6,75 +6,109 @@
 #include "../error/error_codes.hpp"
 #include "../utils/process.hpp"
 #include "../kinetic.hpp"
+#include <thread>
+#include <mutex>
 
 namespace kinetic {
 
-fs::path phase_java_compile(const KineticConfig& cfg,
-                             const KineticEnv& env,
-                             const fs::path& project_root,
-                             const fs::path& classes_dir) {
-    fs::path java_src = project_root / cfg.java_sources;
+static std::mutex compile_mtx;
 
-    if (!fs::exists(java_src)) {
-        phase_log("JAVA_COMPILE", "No Java sources found — skipping");
-        return classes_dir;
+static fs::path find_javac(const KineticEnv& env) {
+    if (!env.javac_path.empty()) {
+        fs::path h = fs::path(env.javac_path) / "bin" / "javac";
+        if (fs::exists(h)) return h;
+    }
+    fs::path from_path = fs::path(which("javac"));
+    if (!from_path.empty()) return from_path;
+    for (auto&& p : {"/usr/bin/javac", "/usr/local/bin/javac",
+                     "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin/javac",
+                     "/opt/homebrew/opt/openjdk@21/bin/javac"}) {
+        if (fs::exists(p)) return p;
+    }
+    return {};
+}
+
+static std::string source_version_flag(int v) {
+    switch (v) { case 17: return "--release"; case 16: return "--release";
+        case 15: case 14: case 13: case 12: case 11: return "--release";
+        case 8: return "-source 8 -target 8"; default: return "--release";
+    }
+}
+
+static std::string target_version_flag(int v) {
+    return std::to_string(v);
+}
+
+void PhaseJavaCompile::execute(PhaseContext& ctx) {
+    const fs::path src_dir = ctx.project_root / "src" / "main" / "java";
+    if (!fs::exists(src_dir)) {
+        phase_warn("JAVA_COMPILE", "No java sources in src/main/java/ — skipping");
+        return;
     }
 
-    if (env.javac_path.empty()) {
-        fatal("JAVA_COMPILE", err::JVM_001,
-              "javac not found on PATH",
-              "",
-              "Install Java: sudo apt install openjdk-17-jdk");
-    }
+    fs::path javac = find_javac(ctx.env);
+    if (javac.empty()) fatal("JAVA_COMPILE", err::JVM_001,
+        "javac not found", "(in PATH)",
+        "Install a JDK: brew install openjdk@21");
 
-    // Collect .java files
-    std::vector<std::string> java_files;
-    for (const auto& entry : fs::recursive_directory_iterator(java_src)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".java") {
-            java_files.push_back(entry.path().string());
-        }
-    }
+    std::vector<fs::path> java_files;
+    for (const auto& e : fs::recursive_directory_iterator(src_dir))
+        if (e.is_regular_file() && e.path().extension() == ".java")
+            java_files.push_back(e.path());
 
     if (java_files.empty()) {
-        phase_log("JAVA_COMPILE", "Java source dir exists but no .java files — skipping");
-        return classes_dir;
+        phase_warn("JAVA_COMPILE", "No .java files found under src/main/java/");
+        return;
     }
 
-    phase_log("JAVA_COMPILE", "Compiling " + std::to_string(java_files.size()) + " .java files ...");
+    ctx.timer.start("JAVA_COMPILE");
+    phase_log("JAVA_COMPILE", "Found " + std::to_string(java_files.size())
+              + " java sources — compiling ...");
+
+    fs::create_directories(ctx.dirs.classes_dir);
 
     std::error_code ec;
-    fs::create_directories(classes_dir, ec);
+    std::vector<fs::path> compiled_files;
+    ctx.compile_classes_.clear();
 
-    // android.jar classpath
-    std::string api_str = std::to_string(cfg.compile_sdk);
-    fs::path android_jar = env.sdk_path / "platforms"
-                         / ("android-" + api_str) / "android.jar";
+    for (const auto& jf : java_files) {
+        std::vector<std::string> cmd = {
+            javac.string(),
+            "-classpath", (ctx.env.sdk_path / "platforms" / std::to_string(ctx.cfg.target_sdk)
+                / "android.jar").string(),
+            "-d", ctx.dirs.classes_dir.string(),
+            "-proc:none",
+            "-Xlint:none"
+        };
 
-    std::vector<std::string> cmd;
-    cmd.push_back(env.javac_path);
-    cmd.push_back("-source"); cmd.push_back(cfg.java_version);
-    cmd.push_back("-target"); cmd.push_back(cfg.java_version);
-    cmd.push_back("-classpath"); cmd.push_back(android_jar.string());
-    cmd.push_back("-d"); cmd.push_back(classes_dir.string());
-    for (const auto& f : java_files) cmd.push_back(f);
+        int ver = 11;
+        try { ver = std::stoi(ctx.cfg.java_version); } catch (...) {}
+        if (ver == 8) { cmd.push_back("-source"); cmd.push_back("8");
+                        cmd.push_back("-target"); cmd.push_back("8");
+        } else {
+            cmd.push_back(source_version_flag(ver));
+            cmd.push_back(target_version_flag(ver));
+        }
+        cmd.push_back(jf.string());
 
-    auto result = exec_proc(cmd, project_root);
-    if (result.exit_code != 0) {
-        std::string detail = result.err.empty() ? result.out : result.err;
-        fatal("JAVA_COMPILE", err::JVM_002,
-              "javac compilation failed",
-              java_src.string(),
-              detail);
+        auto r = exec_proc(cmd, ctx.project_root);
+        if (r.exit_code != 0) {
+            std::lock_guard lk(compile_mtx);
+            ctx.timer.stop(false, "failed");
+            fatal("JAVA_COMPILE", err::JVM_002,
+                  "javac failed: " + jf.filename().string(),
+                  jf.string(), r.err.empty() ? r.out : r.err);
+        }
+
+        std::lock_guard lk(compile_mtx);
+        compiled_files.push_back(jf);
+        phase_log("JAVA_COMPILE",
+                  fs::relative(jf, src_dir).string() + " → .class");
     }
 
-    // Count produced .class files
-    int class_count = 0;
-    for (const auto& entry : fs::recursive_directory_iterator(classes_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".class") ++class_count;
-    }
-
-    phase_log("JAVA_COMPILE", "Done  (" + std::to_string(class_count) + " .class files)");
-    return classes_dir;
+    ctx.compile_classes_ = compiled_files;
+    phase_log("JAVA_COMPILE", "Compiled " + std::to_string(compiled_files.size()) + " sources");
+    ctx.timer.stop(true, std::to_string(compiled_files.size()) + " sources compiled");
 }
 
 } // namespace kinetic

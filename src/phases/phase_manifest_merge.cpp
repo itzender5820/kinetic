@@ -1,71 +1,110 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  phases/phase_manifest_merge.cpp  —  Phase 11: MANIFEST_MERGE
-//  Validate AndroidManifest.xml and copy into staging directory
 // ─────────────────────────────────────────────────────────────────────────────
 #include "phase_manifest_merge.hpp"
-#include "../copy/file_copier.hpp"
 #include "../error/error_reporter.hpp"
 #include "../error/error_codes.hpp"
+#include "../utils/process.hpp"
 #include "../kinetic.hpp"
-
-#include <fstream>
 #include <sstream>
 
 namespace kinetic {
 
-// Minimal validation: check that the file contains <manifest and package=
-static void validate_manifest(const fs::path& manifest_path,
-                               const std::string& expected_package) {
-    std::ifstream f(manifest_path);
-    if (!f.is_open()) {
-        fatal("MANIFEST_MERGE", err::PKG_002,
-              "Cannot open AndroidManifest.xml",
-              manifest_path.string());
+static std::string escape_xml_attr(const std::string& s) {
+    std::string o; o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '&':  o += "&amp;";  break;
+            case '<':  o += "&lt;";   break;
+            case '>':  o += "&gt;";   break;
+            case '"':  o += "&quot;"; break;
+            case '\'': o += "&apos;"; break;
+            default:   o += c;        break;
+        }
     }
-
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    std::string content = ss.str();
-
-    if (content.find("<manifest") == std::string::npos) {
-        fatal("MANIFEST_MERGE", err::PKG_003,
-              "AndroidManifest.xml missing <manifest> root element",
-              manifest_path.string(),
-              "Ensure the file starts with: <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">");
-    }
-
-    if (!expected_package.empty() && content.find(expected_package) == std::string::npos) {
-        phase_warn("MANIFEST_MERGE",
-                   "package=\"" + expected_package + "\" not found in AndroidManifest.xml");
-    }
+    return o;
 }
 
-fs::path phase_manifest_merge(const KineticConfig& cfg,
-                               const KineticEnv& env,
-                               const fs::path& project_root,
-                               const fs::path& staging_dir) {
-    (void)env;
+static std::string escape_android_name(const std::string& s) {
+    std::string o; o.reserve(s.size() + 16);
+    for (char c : s) {
+        switch (c) {
+            case '&':  o += "&amp;";  break;
+            case '<':  o += "&lt;";   break;
+            case '>':  o += "&gt;";   break;
+            default:   o += c;        break;
+        }
+    }
+    return o;
+}
 
-    fs::path manifest_src = project_root / "src" / "main" / "AndroidManifest.xml";
+static std::string build_manifest_xml(const KineticConfig& cfg) {
+    std::ostringstream x;
+    x << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+    x << "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n";
+    x << "    android:versionCode=\"" << cfg.version_code << "\"\n";
+    x << "    android:versionName=\"" << escape_xml_attr(cfg.version_name) << "\"";
 
-    if (!fs::exists(manifest_src)) {
-        fatal("MANIFEST_MERGE", err::PKG_002,
-              "AndroidManifest.xml not found",
-              manifest_src.string());
+    if (!cfg.package_name.empty())
+        x << "\n    package=\"" << escape_xml_attr(cfg.package_name) << "\"";
+
+    x << ">\n";
+    if (cfg.min_sdk >= 1) {
+        x << "    <uses-sdk android:minSdkVersion=\"" << cfg.min_sdk
+          << "\" android:targetSdkVersion=\"" << cfg.target_sdk << "\" />\n";
     }
 
-    phase_log("MANIFEST_MERGE", "Validating AndroidManifest.xml ...");
-    validate_manifest(manifest_src, cfg.package_name);
+    x << "\n    <application\n";
+    if (!cfg.app_name.empty())
+        x << "        android:label=\"" << escape_xml_attr(cfg.app_name) << "\"\n";
+    x << "        android:hasCode=\"true\"\n";
+    x << "        android:name=\"android.app.Application\"\n";
+    x << "    >\n";
 
-    // Copy into staging root
+    std::string activity = cfg.package_name + "/.MainActivity";
+    x << "        <activity android:name=\"" << escape_android_name(activity) << "\"\n";
+    x << "            android:exported=\"true\"\n";
+    x << "            android:configChanges=\"orientation|screenSize|keyboardHidden\">\n";
+    x << "            <intent-filter>\n";
+    x << "                <action android:name=\"android.intent.action.MAIN\" />\n";
+    x << "                <category android:name=\"android.intent.category.LAUNCHER\" />\n";
+    x << "            </intent-filter>\n";
+    x << "        </activity>\n";
+
+    x << "    </application>\n";
+    x << "</manifest>\n";
+    return x.str();
+}
+
+void PhaseManifestMerge::execute(PhaseContext& ctx) {
+    const fs::path src_manifest = ctx.project_root / "src" / "main" / "AndroidManifest.xml";
+    const fs::path dst_manifest = ctx.dirs.staging_dir / "AndroidManifest.xml";
+
+    ctx.timer.start("MANIFEST_MERGE");
+
     std::error_code ec;
-    fs::create_directories(staging_dir, ec);
-    fs::path manifest_dst = staging_dir / "AndroidManifest.xml";
+    fs::create_directories(dst_manifest.parent_path(), ec);
 
-    copy_file_validated(manifest_src, manifest_dst, cfg.verbose_copy, true, "MANIFEST_MERGE");
-    phase_log("MANIFEST_MERGE", "Done  → merged manifest");
+    phase_log("MANIFEST_MERGE", "Generating app manifest ...");
+    std::string manifest_xml = build_manifest_xml(ctx.cfg);
 
-    return manifest_dst;
+    fs::path tmp_manifest = dst_manifest.string() + ".tmp";
+    {
+        std::ofstream ofs(tmp_manifest);
+        if (!ofs) fatal("MANIFEST_MERGE", err::PKG_004,
+            "Failed to write manifest", tmp_manifest.string(),
+            "Check disk permissions in build/intermediates/");
+        ofs << manifest_xml;
+    }
+
+    if (fs::exists(dst_manifest)) fs::remove(dst_manifest, ec);
+    fs::rename(tmp_manifest, dst_manifest, ec);
+    if (ec) fatal("MANIFEST_MERGE", err::PKG_004,
+        "Failed to move manifest into place", dst_manifest.string(),
+        "Check disk permissions in build/intermediates/");
+
+    phase_log("MANIFEST_MERGE", "AndroidManifest.xml generated ✓");
+    ctx.timer.stop(true, "manifest merged");
 }
 
 } // namespace kinetic

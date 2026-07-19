@@ -1,29 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  core/engine.cpp  —  Pipeline orchestration
+//  core/engine.cpp  —  DAG-driven pipeline orchestration
 // ─────────────────────────────────────────────────────────────────────────────
 #include "engine.hpp"
+#include "phase_registry.hpp"
 #include "telemetry.hpp"
 #include "../config/cmake_parser.hpp"
-#include "../env/env_scanner.hpp"
-#include "../env/aapt2_resolver.hpp"
 #include "../error/error_reporter.hpp"
 #include "../utils/process.hpp"
-#include "../phases/phase_res_compile.hpp"
-#include "../phases/phase_link_aprs.hpp"
-#include "../phases/phase_ndk_compile.hpp"
-#include "../phases/phase_java_compile.hpp"
-#include "../phases/phase_kotlin_compile.hpp"
-#include "../phases/phase_dex_convert.hpp"
-#include "../phases/phase_so_copy.hpp"
-#include "../phases/phase_asset_copy.hpp"
-#include "../phases/phase_manifest_merge.hpp"
-#include "../phases/phase_apk_pack.hpp"
-#include "../phases/phase_sign_align.hpp"
 #include "../cli/help_printer.hpp"
 #include "../kinetic.hpp"
 
 #include <iostream>
-#include <fstream>
 
 namespace kinetic {
 
@@ -31,22 +18,8 @@ namespace kinetic {
 BuildEngine::BuildEngine(const CliOptions& opts, const fs::path& project_root)
     : opts_(opts), project_root_(project_root) {}
 
-// ── Directory setup ───────────────────────────────────────────────────────────
-void BuildEngine::setup_dirs() {
-    build_dir_   = project_root_ / "build";
-    flat_dir_    = build_dir_ / "intermediates" / "flat";
-    aprs_dir_    = build_dir_ / "intermediates" / "aprs";
-    obj_dir_     = build_dir_ / "intermediates" / "obj";
-    lib_dir_     = build_dir_ / "intermediates" / "lib";
-    classes_dir_ = build_dir_ / "intermediates" / "classes";
-    dex_dir_     = build_dir_ / "intermediates" / "dex";
-    staging_dir_ = build_dir_ / "intermediates" / "staging";
-    output_dir_  = project_root_ / cfg_.output_dir;
-}
-
 // ── Main entry ────────────────────────────────────────────────────────────────
 int BuildEngine::run() {
-    // Apply --no-color globally
     if (opts_.no_color) g_color_enabled = false;
 
     switch (opts_.command) {
@@ -65,7 +38,8 @@ int BuildEngine::run() {
 
 // ── separator ─────────────────────────────────────────────────────────────────
 void BuildEngine::separator() const {
-    std::cout << c(col::DIM, "  ─────────────────────────────────────────────────────────────") << "\n";
+    std::cout << c(col::DIM,
+        "  ─────────────────────────────────────────────────────────────") << "\n";
 }
 
 // ── cmd_version ───────────────────────────────────────────────────────────────
@@ -76,7 +50,6 @@ int BuildEngine::cmd_version() {
 
 // ── cmd_env ───────────────────────────────────────────────────────────────────
 int BuildEngine::cmd_env() {
-    // For --env we only scan environment, no config needed
     try {
         auto env = discover_env(opts_.sdk_override, opts_.ndk_override,
                                 opts_.aapt2_override);
@@ -93,8 +66,8 @@ int BuildEngine::cmd_check() {
     try {
         CMakeParser parser;
         fs::path cmake_path = project_root_ / opts_.cmake_file;
-        cfg_ = parser.parse(cmake_path, project_root_);
-        cfg_.validate();
+        auto cfg = parser.parse(cmake_path, project_root_);
+        cfg.validate();
         std::cout << c(col::BGREEN, "✓ ") << "kinetic.cmake is valid.\n";
         return 0;
     } catch (const std::exception& e) {
@@ -128,7 +101,7 @@ int BuildEngine::cmd_rebuild() {
     return cmd_build();
 }
 
-// ── cmd_build ────────────────────────────────────────────────────────────────
+// ── cmd_build  (DAG-driven) ─────────────────────────────────────────────────
 int BuildEngine::cmd_build() {
     // Banner
     std::cout << "\n"
@@ -136,128 +109,80 @@ int BuildEngine::cmd_build() {
     separator();
 
     try {
-        // ── Phase 01: ENV_SCAN ────────────────────────────────────────────────
-        timer_.start("ENV_SCAN");
-        env_ = discover_env(opts_.sdk_override, opts_.ndk_override,
-                            opts_.aapt2_override);
-        timer_.stop(true, "SDK+NDK resolved");
+        // 1. Register all phases into the DAG.
+        Dag dag;
+        register_all_phases(dag);
 
-        // ── Phase 02: CMAKE_PARSE ─────────────────────────────────────────────
-        timer_.start("CMAKE_PARSE");
-        CMakeParser parser;
-        fs::path cmake_path = project_root_ / opts_.cmake_file;
-        cfg_ = parser.parse(cmake_path, project_root_);
-        cfg_.validate();
-
-        // Apply color from config
-        if (!cfg_.color_output) g_color_enabled = false;
-        if (opts_.no_color)     g_color_enabled = false;
-
-        // Expand ~ in paths
-        const char* home_c = std::getenv("HOME");
-        if (home_c) cfg_.resolve_tilde_paths(home_c);
-
-        // Override ABI if specified on CLI
-        if (!opts_.abi_filter.empty()) cfg_.abi_filters = { opts_.abi_filter };
-
-        // Re-resolve NDK clang++ for the correct min API
-        reresolve_ndk_for_api(env_, cfg_.min_sdk);
-        // Update build_tools_ver in env if config specifies one
-        if (!cfg_.build_tools_ver.empty() && env_.build_tools_ver != cfg_.build_tools_ver) {
-            fs::path bt = env_.sdk_path / "build-tools" / cfg_.build_tools_ver;
-            if (fs::exists(bt)) {
-                env_.build_tools_path = bt;
-                env_.build_tools_ver  = cfg_.build_tools_ver;
-                env_.sdk_aapt2        = bt / "aapt2";
-                env_.d8               = bt / "d8";
-                env_.apksigner        = bt / "apksigner";
-                env_.zipalign         = bt / "zipalign";
-            }
+        // 2. Validate edges (cycle detection, topo sort).
+        std::string dag_err;
+        if (!dag.validate(dag_err)) {
+            std::cerr << c(col::BRED, "DAG error: ") << dag_err << "\n";
+            return 1;
         }
 
-        setup_dirs();
-        timer_.stop(true, std::to_string(24) + " config keys");
-
-        // ── Phase 03: RES_COMPILE ─────────────────────────────────────────────
-        timer_.start("RES_COMPILE");
-        int res_count = phase_res_compile(cfg_, env_, project_root_, flat_dir_);
-        timer_.stop(true, std::to_string(res_count) + " .flat files");
-
-        // ── Phase 04: LINK_APRS ───────────────────────────────────────────────
-        timer_.start("LINK_APRS");
-        fs::path aprs = phase_link_aprs(cfg_, env_, project_root_, flat_dir_, aprs_dir_);
-        timer_.stop(true, "resources.aprs");
-
-        // ── Phase 05: NDK_COMPILE ─────────────────────────────────────────────
-        timer_.start("NDK_COMPILE");
-        auto so_files = phase_ndk_compile(cfg_, env_, project_root_, obj_dir_, lib_dir_);
-        timer_.stop(true, std::to_string(so_files.size()) + " .so files");
-
-        // ── Phase 06: JAVA_COMPILE ────────────────────────────────────────────
-        timer_.start("JAVA_COMPILE");
-        phase_java_compile(cfg_, env_, project_root_, classes_dir_);
-        // Count .class files
-        int jclass = 0;
-        if (fs::exists(classes_dir_))
-            for (const auto& e : fs::recursive_directory_iterator(classes_dir_))
-                if (e.path().extension() == ".class") ++jclass;
-        timer_.stop(true, std::to_string(jclass) + " .class files");
-
-        // ── Phase 07: KOTLIN_COMPILE ──────────────────────────────────────────
-        timer_.start("KOTLIN_COMPILE");
-        phase_kotlin_compile(cfg_, env_, project_root_, classes_dir_);
-        int kclass = 0;
-        if (fs::exists(classes_dir_))
-            for (const auto& e : fs::recursive_directory_iterator(classes_dir_))
-                if (e.path().extension() == ".class") ++kclass;
-        timer_.stop(true, std::to_string(kclass) + " .class files");
-
-        // ── Phase 08: DEX_CONVERT ─────────────────────────────────────────────
-        timer_.start("DEX_CONVERT");
-        fs::path dex_out;
-        if (!opts_.no_dex) {
-            dex_out = phase_dex_convert(cfg_, env_, project_root_, classes_dir_, dex_dir_);
-        } else {
-            phase_log("DEX_CONVERT", "--no-dex flag set — skipping");
+        const auto order = dag.topo_order();
+        std::string names;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            if (i) names += " → ";
+            names += order[i];
         }
-        timer_.stop(true, "classes.dex");
+        phase_log("DAG", "Validated " + std::to_string(order.size())
+                  + " phases: " + names);
 
-        // ── Phase 09: SO_COPY ─────────────────────────────────────────────────
-        timer_.start("SO_COPY");
-        int so_copied = phase_so_copy(cfg_, env_, project_root_, lib_dir_, staging_dir_);
-        timer_.stop(true, std::to_string(so_copied) + " libs staged");
+        // 3. Build the PhaseContext.
+        PhaseContext ctx;
+        ctx.project_root  = project_root_;
+        ctx.verbose       = opts_.verbose;
+        ctx.quiet         = opts_.quiet;
+        ctx.no_color      = opts_.no_color;
+        ctx.no_dex        = opts_.no_dex;
+        ctx.no_sign       = opts_.no_sign;
+        ctx.release_mode  = opts_.release_mode;
+        ctx.jobs          = opts_.jobs;
+        ctx.abi_filter    = opts_.abi_filter;
+        ctx.single_phase  = opts_.single_phase;
+        ctx.sdk_override  = opts_.sdk_override;
+        ctx.ndk_override  = opts_.ndk_override;
+        ctx.aapt2_override = opts_.aapt2_override;
+        ctx.cmake_file    = opts_.cmake_file;
 
-        // ── Phase 10: ASSET_COPY ──────────────────────────────────────────────
-        timer_.start("ASSET_COPY");
-        int assets_copied = phase_asset_copy(cfg_, env_, project_root_, staging_dir_);
-        timer_.stop(true, std::to_string(assets_copied) + " files staged");
+        // 4. Execute via the thread-pool executor.
+        int jobs = ctx.jobs > 0 ? ctx.jobs
+                 : static_cast<int>(std::thread::hardware_concurrency());
+        if (jobs < 1) jobs = 1;
 
-        // ── Phase 11: MANIFEST_MERGE ──────────────────────────────────────────
-        timer_.start("MANIFEST_MERGE");
-        phase_manifest_merge(cfg_, env_, project_root_, staging_dir_);
-        timer_.stop(true, "merged manifest");
+        Executor executor(dag, jobs);
+        int rc = executor.run(ctx);
 
-        // ── Phase 12: APK_PACK ────────────────────────────────────────────────
-        timer_.start("APK_PACK");
-        fs::path apk = phase_apk_pack(cfg_, env_, project_root_,
-                                      staging_dir_, aprs, dex_dir_, output_dir_);
-        timer_.stop(true, cfg_.output_name + ".apk");
-
-        // ── Phase 13: SIGN_ALIGN ──────────────────────────────────────────────
-        fs::path final_apk = apk;
-        timer_.start("SIGN_ALIGN");
-        if (!opts_.no_sign) {
-            final_apk = phase_sign_align(cfg_, env_, project_root_, apk);
-        } else {
-            phase_log("SIGN_ALIGN", "--no-sign flag set — skipping");
-        }
-        timer_.stop(true, "signed + aligned");
+        if (rc != 0) return 1;
 
         separator();
 
-        // ── Phase 14: TELEMETRY ───────────────────────────────────────────────
-        if (cfg_.telemetry && !opts_.quiet) {
-            auto summary = make_summary(timer_, final_apk);
+        // 5. Telemetry summary (if enabled).
+        if (!ctx.single_phase.empty()) return 0;
+
+        fs::path final_apk = ctx.dirs.output_dir
+                           / (ctx.cfg.app_name + "-signed.apk");
+
+        TelemetrySummary summary;
+        summary.all_passed = true;
+        summary.apk_path  = final_apk;
+        if (!final_apk.empty() && fs::exists(final_apk))
+            summary.apk_size = file_size(final_apk);
+
+        long long total_ns = 0;
+        for (const auto& r : executor.results()) {
+            total_ns += r.duration_ns;
+            PhaseRecord rec;
+            rec.name        = r.phase_name;
+            rec.duration_ns = r.duration_ns;
+            rec.success     = r.success;
+            rec.output_desc = r.output_desc;
+            summary.phases.push_back(rec);
+        }
+        summary.total_ns = total_ns;
+
+        if (ctx.cfg.telemetry && !ctx.quiet) {
             print_telemetry(summary);
         }
 
@@ -274,13 +199,15 @@ int BuildEngine::cmd_install() {
     int r = cmd_build();
     if (r != 0) return r;
 
-    // Find the produced APK
-    fs::path out_dir = project_root_ / cfg_.output_dir;
+    CMakeParser parser;
+    fs::path cmake_path = project_root_ / opts_.cmake_file;
+    auto cfg = parser.parse(cmake_path, project_root_);
+
+    fs::path out_dir = project_root_ / cfg.output_dir;
     fs::path apk_path;
     if (fs::exists(out_dir)) {
-        for (const auto& e : fs::directory_iterator(out_dir)) {
+        for (const auto& e : fs::directory_iterator(out_dir))
             if (e.path().extension() == ".apk") { apk_path = e.path(); break; }
-        }
     }
     if (apk_path.empty()) {
         std::cerr << c(col::BRED, "Error: ") << "No APK found in " << out_dir << "\n";
@@ -296,7 +223,11 @@ int BuildEngine::cmd_run() {
     int r = cmd_install();
     if (r != 0) return r;
 
-    std::string activity = cfg_.package_name + "/.MainActivity";
+    CMakeParser parser;
+    fs::path cmake_path = project_root_ / opts_.cmake_file;
+    auto cfg = parser.parse(cmake_path, project_root_);
+
+    std::string activity = cfg.package_name + "/.MainActivity";
     phase_log("RUN", "adb shell am start -n " + activity);
     return adb({"shell", "am", "start", "-n", activity});
 }

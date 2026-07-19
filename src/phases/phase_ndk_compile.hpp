@@ -1,16 +1,32 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  phases/phase_ndk_compile.hpp  —  Phase 05: NDK_COMPILE
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma once
-#include "../config/config_model.hpp"
-#include "../env/env_scanner.hpp"
-#include <filesystem>
-#include <vector>
-#include <string>
+#include "../dag/phase.hpp"
+
 namespace kinetic {
-namespace fs = std::filesystem;
-// Compile all C++ sources listed in cfg.sources for each ABI.
-// Returns paths to the produced .so files.
-std::vector<fs::path> phase_ndk_compile(const KineticConfig& cfg,
-                                         const KineticEnv& env,
-                                         const fs::path& project_root,
-                                         const fs::path& obj_dir,
-                                         const fs::path& lib_dir);
+
+class PhaseNdkCompile final : public Phase {
+public:
+    const char* name() const override { return "NDK_COMPILE"; }
+
+    std::vector<std::string> requires() const override {
+        return {"CMAKE_PARSE"};
+    }
+
+    std::vector<fs::path> provides(const PhaseContext& ctx) const override {
+        std::vector<fs::path> out;
+        for (const auto& abi : ctx.cfg.abi_filters) {
+            fs::path so = ctx.dirs.lib_dir / abi / "libkinetic.so";
+            out.push_back(so);
+        }
+        return out;
+    }
+
+    bool parallelizable() const override { return true; }
+    bool cacheable()      const override { return true; }
+
+    void execute(PhaseContext& ctx) override;
+};
+
 } // namespace kinetic
